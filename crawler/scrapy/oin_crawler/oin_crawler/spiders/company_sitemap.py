@@ -14,8 +14,8 @@ class CompanySitemapSpider(scrapy.Spider):
         "ROBOTSTXT_OBEY": True,
     }
 
-    def _init_(self, domain=None, start_url=None, *args, **kwargs):
-        super()._init_(*args, **kwargs)
+    def __init__(self, domain=None, start_url=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         # akzeptiere Parameter von -a UND bereits gesetzte Attribute
         if start_url:
             self.start_url = start_url
