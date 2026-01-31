@@ -86,9 +86,10 @@ DOWNLOAD_DELAY = 1
 # Set settings whose default value is deprecated to a future-proof value
 FEED_EXPORT_ENCODING = "utf-8"
 
+# --- OIN config ---
+OIN_API_BASE = "http://localhost:8000"
 
 # --- OIN pipeline ---
 ITEM_PIPELINES = {
     "oin_crawler.pipelines.IngestPipeline": 300,
 }
-ROBOTSTXT_OBEY = True  # lassen wir an
