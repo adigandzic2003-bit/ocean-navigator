@@ -1,0 +1,16 @@
+# Virtuelle Umgebung
+.venv/
+_pycache_/
+*.pyc
+
+# Daten und Logs
+data/
+logs/
+
+# Environment-Dateien
+.env
+.DS_Store
+
+# Docker-Volumes
+infra/pgdata/
+infra/qdrant/

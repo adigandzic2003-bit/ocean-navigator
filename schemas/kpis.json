@@ -1,0 +1,15 @@
+[
+  {
+    "id": "wastewater_treated",
+    "name": "Contaminated wastewater treated",
+    "unit": "m3_per_year",
+    "regex_hints": [
+      "(treated|processed)\\s+(wastewater|effluent).{0,40}?(\\d[\\d.,\\s]*)(m3|m³|cubic\\s+meters)"
+    ],
+    "normalization": {
+      "to_unit": "m3_per_year",
+      "allow_per_day": true
+    },
+    "description": "Annual volume of contaminated wastewater treated before discharge."
+  }
+]
