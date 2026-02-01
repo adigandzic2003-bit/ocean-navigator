@@ -13,6 +13,21 @@ def _build_context(text: str, start: int, end: int, window: int = 80) -> str:
 def _build_context_snippet(text: str, start: int, end: int, window: int = 80) -> str:
     return _build_context(text, start, end, window)
 
+def _get_sentence_bounds(text: str, pos: int) -> tuple[int, int]:
+    """
+    Legacy helper used by other detectors (coastal/jobs).
+    Simple sentence boundary detection around position pos.
+    """
+    start = pos
+    while start > 0 and text[start - 1] not in ".!?":
+        start -= 1
+
+    end = pos
+    while end < len(text) and text[end] not in ".!?":
+        end += 1
+
+    return start, min(len(text), end + 1)
+
 
 # =============================================================================
 # Number parsing
