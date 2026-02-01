@@ -3,6 +3,10 @@
 import re
 from typing import Optional, Dict, List
 
+# --- Backwards compatibility for other detectors ----------------------------
+
+def _build_context_snippet(text: str, start: int, end: int, window: int = 80) -> str:
+    return _build_context(text, start, end, window)
 
 # === A0: Einfacher Wasser-Mention-Flag ========================================
 
