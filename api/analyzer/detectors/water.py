@@ -254,4 +254,32 @@ def detect_water_pollutants_concentration_mg_l(text: str):
     """
     return None
 
+# =============================================================================
+# Legacy compatibility stubs (do NOT remove – required by other detectors)
+# =============================================================================
+
+def _parse_quantity_with_multiplier(raw_number: str, raw_multiplier: Optional[str]):
+    """
+    Legacy helper for coastal/jobs detectors.
+    Tabellenlogik nutzt eigene Pfade – hier nur Fallback.
+    """
+    try:
+        value = _normalize_number(raw_number)
+    except Exception:
+        return None
+
+    if not raw_multiplier:
+        return value
+
+    return value * MULTIPLIER_WORDS.get(raw_multiplier.lower().strip(), 1)
+
+
+def detect_water_pollutants_concentration_mg_l(text: str):
+    """
+    Legacy detector stub.
+    Konzentrations-KPIs (mg/L) werden im aktuellen Prototyp
+    bewusst nicht extrahiert (Tabellen zu uneindeutig).
+    """
+    return None
+
 
