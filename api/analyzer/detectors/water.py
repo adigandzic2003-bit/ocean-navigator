@@ -255,6 +255,11 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         if not NUMBER_PATTERN.search(row):
             continue
 
+        # --- Guard: ignore trivial numeric-only rows like "2" / "17" / "4" ---
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", row.strip()):
+            continue
+
+
         # --- Precision guards: reject obviously wrong contexts ---
         # 1) intensity
         if INTENSITY_HINT.search(row_l) or "kg/m" in row_l or "mg/l" in row_l:
