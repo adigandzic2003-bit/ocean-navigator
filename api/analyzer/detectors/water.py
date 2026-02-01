@@ -284,48 +284,75 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         if not row_kpi:
             continue
 
-        # --- Extract candidate numbers ---
-        numbers = NUMBER_PATTERN.findall(row)
-        if not numbers:
+        # --- Guard: ignore trivial numeric-only rows like "2" / "17" / "4" ---
+        if re.fullmatch(r"\d+(?:[.,]\d+)?", row.strip()):
             continue
-
-        # If row contains only a year and no other numeric, skip (avoid year-as-volume)
-        # Example: "By 2030 ..." would be skipped already by TARGET_LANGUAGE_HINT,
-        # but this helps other cases.
-        only_years = all(YEAR_PATTERN.fullmatch(n) for n in numbers)
+        
+        # --- Extract candidate numbers (prefer numbers near unit tokens) ---
+        nums = list(NUMBER_PATTERN.finditer(row))
+        if not nums:
+            continue
+        
+        # Skip rows that contain only years (avoid year-as-volume)
+        only_years = all(YEAR_PATTERN.fullmatch(m.group(0)) for m in nums)
         if only_years:
             continue
-
-        # Heuristic: in real tables, the value is often the first non-year number
-        for num in numbers:
-            # skip pure years
-            if YEAR_PATTERN.fullmatch(num):
+        
+        # If the row itself contains a volume unit, pick the number closest to that unit.
+        # Otherwise, be conservative: require recent unit context and a short (table-like) row.
+        um = VOLUME_UNIT_PATTERN.search(row_l) or UNIT_ONLY_HINT.search(row_l)
+        unit_pos = um.start() if um else None
+        
+        picked = None
+        
+        if unit_pos is not None:
+            best = None
+            best_dist = 10**9
+            for m in nums:
+                if YEAR_PATTERN.fullmatch(m.group(0)):
+                    continue
+                dist = abs(m.start() - unit_pos)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = m
+            picked = best
+        else:
+            if not have_unit_context:
                 continue
-
-            try:
-                value = _normalize_number(num)
-            except ValueError:
+            # avoid narrative lines
+            if len(row_l) > 140:
                 continue
-
-            value = _apply_multiplier(value, current_multiplier)
-
-            # sanity: prevent absurd tiny "1,2,3" enumerations from becoming volumes
-            # if row starts with "1)" or "2)" and has no other strong evidence, skip
-            if re.match(r"^\s*\d+\)\s*", row) and not row_has_unit:
-                continue
-
-            hits.append(
-                {
-                    "kpi_key": f"water_{row_kpi}_total_m3",
-                    "value": value,
-                    "ctx": row,
-                }
-            )
-
-            if len(hits) >= max_hits:
-                return hits
-
-    return hits
+            # pick first non-year number
+            for m in nums:
+                if YEAR_PATTERN.fullmatch(m.group(0)):
+                    continue
+                picked = m
+                break
+        
+        if not picked:
+            continue
+        
+        # sanity: prevent "1) ..." enumerations from becoming volumes when unit isn't on the same row
+        if re.match(r"^\s*\d+\)\s*", row) and unit_pos is None:
+            continue
+        
+        try:
+            value = _normalize_number(picked.group(0))
+        except ValueError:
+            continue
+        
+        value = _apply_multiplier(value, current_multiplier)
+        
+        hits.append(
+            {
+                "kpi_key": f"water_{row_kpi}_total_m3",
+                "value": value,
+                "ctx": row,
+            }
+        )
+        
+        if len(hits) >= max_hits:
+            return hits
 
 
 # =============================================================================
