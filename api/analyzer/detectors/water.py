@@ -125,6 +125,9 @@ NON_VOLUME_CONTEXT_HINTS = re.compile(
     re.IGNORECASE,
 )
 
+# Guard: section headings that start with "1. Foo" / "2. Bar"
+SECTION_HEADING_HINT = re.compile(r"^\s*\d{1,2}\.\s+[A-Za-z]", re.IGNORECASE)
+
 # Extend triggers to catch marketing/variation without ML
 WATER_HEADERS = {
     "withdrawal": [
@@ -216,9 +219,11 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
     - Reject intensity rows (kg/m³, per m³, m³/ha, etc.).
     - Reject forward-looking/target language for "total" KPIs (aim/target/by 2030...).
     - Reject common non-volume contexts (people, minutes, % ...).
-    - Prevent 'sticky unit' over the whole document via TTL.
+    - Prevent 'sticky unit' over the whole document via TTL (reduced).
     - Do NOT extract multiple unrelated numbers per row; pick the number closest to a unit.
     - Skip numeric-only rows ("2", "17", ...).
+    - Skip section headings like "1. The Company".
+    - If no unit on row: require water context on the same row (prevents headings from being captured).
     """
     rows = _iter_table_rows(text)
 
@@ -244,11 +249,11 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         if unit_match:
             current_multiplier = unit_match.group(1)  # may be None
             have_unit_context = True
-            unit_context_ttl = 8
+            unit_context_ttl = 4  # reduced to avoid sticky unit bleed
         elif UNIT_ONLY_HINT.search(row_l):
             current_multiplier = None
             have_unit_context = True
-            unit_context_ttl = 8
+            unit_context_ttl = 4
         else:
             # decay unit context to avoid becoming sticky across the whole document
             if unit_context_ttl > 0:
@@ -263,6 +268,10 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
 
         # --- Guard: ignore trivial numeric-only rows like "2" / "17" ---
         if re.fullmatch(r"\d+(?:[.,]\d+)?", row.strip()):
+            continue
+
+        # --- Guard: ignore section headings like "1. The Company" ---
+        if SECTION_HEADING_HINT.match(row) and len(row.strip()) <= 80:
             continue
 
         # --- Precision guards: reject obviously wrong contexts ---
@@ -318,6 +327,9 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         else:
             # no unit on row: be conservative
             if not have_unit_context:
+                continue
+            # no unit -> require explicit water context in same row to prevent headings
+            if not WATER_CONTEXT_PATTERN.search(row):
                 continue
             # avoid narrative lines
             if len(row_l) > 140:
