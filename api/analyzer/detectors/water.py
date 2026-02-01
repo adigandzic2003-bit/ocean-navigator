@@ -222,3 +222,23 @@ def detect_water_management_measures_flag(text: str) -> Optional[Dict]:
             "ctx": "water-related management action",
         }
     return None
+
+# =============================================================================
+# Backwards-compatible wrappers (API stability)
+# =============================================================================
+
+def detect_water_withdrawal_total_m3(text: str):
+    return detect_water_table_volumes(text)
+
+
+def detect_water_consumption_total_m3(text: str):
+    return detect_water_table_volumes(text)
+
+
+def detect_water_recycled_total_m3(text: str):
+    return detect_water_table_volumes(text)
+
+
+def detect_water_discharge_total_m3(text: str):
+    return detect_water_table_volumes(text)
+
