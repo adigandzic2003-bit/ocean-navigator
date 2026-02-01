@@ -3,8 +3,7 @@
 _pycache_/
 *.pyc
 
-# Daten und Logs
-data/
+# Logs
 logs/
 
 # Environment-Dateien
