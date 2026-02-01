@@ -1,5 +1,3 @@
-# api/routers/analyze.py
-
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, Query
@@ -61,18 +59,29 @@ def analyze_docs(
         extracted_from_url = doc.get("extracted_from_url")
         company = doc.get("company")
 
+        # --- Analyzer aufrufen ---
         kpi_results = analyze_document_row(doc)
 
-        for kpi in kpi_results:
+        # --- NEU: KPI-Ergebnisse normalisieren (Dict ODER List[Dict]) ---
+        normalized_kpis: List[Dict[str, Any]] = []
+
+        for item in kpi_results:
+            if isinstance(item, list):
+                normalized_kpis.extend(item)
+            elif isinstance(item, dict):
+                normalized_kpis.append(item)
+            # alles andere wird bewusst ignoriert
+
+        # --- KPIs persistieren ---
+        for kpi in normalized_kpis:
             kpi_key = kpi["kpi_key"]
             kpi_value = kpi["kpi_value"]
             kpi_unit = kpi.get("kpi_unit")
             kpi_context = kpi.get("ctx")
 
-            # Aktuell simple Default-Score
+            # Aktuell fixer Default-Score (DSR-tauglich, deterministisch)
             relevance_score = 1.0
 
-            # KPI-Insert – WICHTIG: source_id kommt vom DOC und ist NICHT NULL
             cur.execute(
                 """
                 INSERT INTO oin.oin_master (
@@ -89,21 +98,21 @@ def analyze_docs(
                     relevance_score
                 )
                 VALUES (
-                    'kpi',           -- record_type
-                    'kpi',           -- source_type
-                    %s,              -- source_id (hier vom DOC)
-                    %s,              -- company
-                    %s,              -- kpi_key
-                    %s,              -- kpi_value
-                    %s,              -- kpi_unit
-                    %s,              -- kpi_context
-                    %s,              -- extracted_from_url
-                    %s,              -- doc_ref_id
-                    %s               -- relevance_score
+                    'kpi',
+                    'kpi',
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
                 );
                 """,
                 (
-                    doc_source_id,       # source_id: NICHT NULL
+                    doc_source_id,       # source_id (vom DOC, NICHT NULL)
                     company,
                     kpi_key,
                     kpi_value,
@@ -116,7 +125,7 @@ def analyze_docs(
             )
             kpi_inserted += 1
 
-        # 3) Dokument-Status auf 'processed' setzen (auch wenn kein KPI gefunden wurde)
+        # 3) Dokument-Status auf 'processed' setzen
         cur.execute(
             """
             UPDATE oin.oin_master
