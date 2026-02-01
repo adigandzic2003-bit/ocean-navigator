@@ -3,7 +3,7 @@
 import os
 import re
 import html as ihtml
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Filter A
 from .relevance_filter import is_potentially_relevant
@@ -20,7 +20,6 @@ from .detectors.water import (
     detect_water_stress_flag,
     detect_water_management_measures_flag,
 )
-
 
 # Climate Detectors (B1–B2)
 from .detectors.climate import (
@@ -42,20 +41,37 @@ from .detectors.jobs import (
     detect_local_jobs_share_percent,
 )
 
+# -----------------------------------------------------------------------------
+# Text normalization
+# -----------------------------------------------------------------------------
+
+_TAG_LIKELY_HTML = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"(?is)<script.*?>.*?</script>")
+_STYLE_RE = re.compile(r"(?is)<style.*?>.*?</style>")
+_OTHER_TAGS_RE = re.compile(r"(?s)<[^>]+>")
+_WS_RE = re.compile(r"[ \t\r\f\v]+")
+_MULTI_NL_RE = re.compile(r"\n\s*\n+")
+
+
+def _looks_like_html(s: str) -> bool:
+    if not s:
+        return False
+    # cheap heuristic: if we see multiple tags, treat as html-ish
+    return bool(_TAG_LIKELY_HTML.search(s))
+
 
 def _html_to_text(s: str) -> str:
     """
-    Sehr einfacher HTML->Plaintext Cleaner (stdlib-only).
-    Reicht für Prototyp/Stress-Tests, ohne BeautifulSoup-Abhängigkeit.
+    Very simple HTML->Plaintext cleaner (stdlib-only).
+    Keeps newlines around common block-ish tags so tables/numbers don't glue together.
     """
     if not s:
         return ""
 
-    # Entferne script/style komplett
-    s = re.sub(r"(?is)<script.*?>.*?</script>", " ", s)
-    s = re.sub(r"(?is)<style.*?>.*?</style>", " ", s)
+    s = _SCRIPT_RE.sub(" ", s)
+    s = _STYLE_RE.sub(" ", s)
 
-    # Ersetze <br>/<p>/<li> etc. durch Newlines, damit Zahlen/Einheiten nicht verkleben
+    # Add newlines for some structural tags
     s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", s)
     s = re.sub(r"(?i)</\s*p\s*>", "\n", s)
     s = re.sub(r"(?i)</\s*li\s*>", "\n", s)
@@ -63,114 +79,196 @@ def _html_to_text(s: str) -> str:
     s = re.sub(r"(?i)</\s*tr\s*>", "\n", s)
     s = re.sub(r"(?i)</\s*td\s*>", " ", s)
 
-    # Entferne alle übrigen Tags
-    s = re.sub(r"(?s)<[^>]+>", " ", s)
-
-    # HTML entities dekodieren (&nbsp; etc.)
+    s = _OTHER_TAGS_RE.sub(" ", s)
     s = ihtml.unescape(s)
 
-    # Whitespace normalisieren
-    s = re.sub(r"[ \t\r\f\v]+", " ", s)
-    s = re.sub(r"\n\s*\n+", "\n", s)
+    s = _WS_RE.sub(" ", s)
+    s = _MULTI_NL_RE.sub("\n", s)
 
     return s.strip()
 
 
+def _normalize_text(raw: str) -> str:
+    """
+    Normalizes input text for detectors.
+    Only runs HTML stripping if the content looks like HTML, otherwise keeps plaintext as-is.
+    """
+    if not raw:
+        return ""
+    if _looks_like_html(raw):
+        return _html_to_text(raw)
+    # Plaintext: still normalize excessive whitespace lightly, keep linebreaks.
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = _WS_RE.sub(" ", raw)
+    raw = _MULTI_NL_RE.sub("\n", raw)
+    return raw.strip()
+
+
+# -----------------------------------------------------------------------------
+# KPI utilities
+# -----------------------------------------------------------------------------
+
+def _as_list(maybe_kpis: Any) -> List[Dict[str, Any]]:
+    """
+    Normalize detector return types to List[Dict].
+    - None -> []
+    - Dict -> [Dict]
+    - List[Dict] -> List[Dict]
+    """
+    if not maybe_kpis:
+        return []
+    if isinstance(maybe_kpis, dict):
+        return [maybe_kpis]
+    if isinstance(maybe_kpis, list):
+        # keep only dict items, ignore weird stuff silently
+        return [x for x in maybe_kpis if isinstance(x, dict)]
+    return []
+
+
+def _set_defaults(kpi: Dict[str, Any], url: Optional[str]) -> Dict[str, Any]:
+    """
+    Ensure stable fields exist, while staying compatible with existing DB insert logic.
+    (We do NOT rename keys here; we only add safe defaults.)
+    """
+    kpi.setdefault("record_type", "kpi")
+    kpi.setdefault("source_type", "kpi")
+    kpi.setdefault("company", None)
+
+    # Common convenience keys used across the project:
+    # some detectors use ctx, some use kpi_context; keep both aligned.
+    if "ctx" in kpi and "kpi_context" not in kpi:
+        kpi["kpi_context"] = kpi["ctx"]
+    if "kpi_context" in kpi and "ctx" not in kpi:
+        kpi["ctx"] = kpi["kpi_context"]
+
+    # Store URL if downstream wants it (safe no-op if insert ignores it)
+    if url and "extracted_from_url" not in kpi:
+        kpi["extracted_from_url"] = url
+
+    return kpi
+
+
+def _dedupe_kpis(kpis: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Lightweight dedupe to prevent massive duplicates from table extraction.
+    Dedupe key: (kpi_key, kpi_value, kpi_unit, normalized ctx prefix)
+    """
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for k in kpis:
+        key = (
+            k.get("kpi_key"),
+            str(k.get("kpi_value")),
+            k.get("kpi_unit"),
+            (k.get("kpi_context") or k.get("ctx") or "")[:160].strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(k)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Main entrypoint
+# -----------------------------------------------------------------------------
+
 def analyze_document_row(doc_row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Nimmt eine Dokument-Zeile (aus der DB oder dem Crawler),
-    entscheidet über Relevanz (Filter A) und extrahiert KPIs.
-    Gibt eine Liste von KPI-Dicts zurück.
+    Takes a document row, optionally applies Filter A, then runs detectors and returns KPI dicts.
+
+    Key improvements:
+    - Robust handling of detector outputs (Dict vs List[Dict]).
+    - Optional Filter A behavior that does not hard-block extraction by default in evaluation.
+    - Stable defaults and basic deduplication.
+    - Helpful debug logging when KPI extraction returns nothing.
     """
 
     raw = doc_row.get("raw_text") or ""
     url = doc_row.get("extracted_from_url")
 
-    # DEBUG: Filter A optional überspringen (für Stress-Tests / kontrollierte Runs)
+    # --- Env switches ---
+    # 1) Skip filter entirely (stress tests / controlled runs)
     skip_filter_a = os.environ.get("SKIP_FILTER_A", "").lower() in ("1", "true", "yes")
 
-    # Normalisierung: HTML -> Plaintext, falls HTML-artig
-    # (Wir wenden das immer an; bei Plaintext schadet es praktisch nicht.)
-    text = _html_to_text(raw)
+    # 2) Soft filter mode: do not block extraction, only annotate (recommended)
+    # If set, Filter A is evaluated but never returns [] solely due to irrelevance.
+    soft_filter_a = os.environ.get("SOFT_FILTER_A", "").lower() in ("1", "true", "yes")
 
-    # --- 1) Filter A: Grobfilter ---
-    if (not skip_filter_a) and (not is_potentially_relevant(text, url=url)):
-        return []
+    # 3) Debug printouts (stdout) for local runs
+    debug_kpi = os.environ.get("DEBUG_KPI", "").lower() in ("1", "true", "yes")
 
-    # --- 2) KPI-Detektoren ---
+    # --- Normalize text ---
+    text = _normalize_text(raw)
+
+    # --- Filter A ---
+    relevant = True
+    if not skip_filter_a:
+        try:
+            relevant = bool(is_potentially_relevant(text, url=url))
+        except Exception as e:
+            # In prototype mode, we avoid hard failures due to filter exceptions
+            relevant = True
+            if debug_kpi:
+                print(f"[kpi_analyzer] Filter A error -> treating as relevant: {e!r}")
+
+        if (not soft_filter_a) and (not relevant):
+            # Hard block only when SOFT_FILTER_A is not enabled
+            if debug_kpi:
+                print("[kpi_analyzer] Filter A blocked document (hard mode).")
+            return []
+
+    # --- Detectors ---
     kpis: List[Dict[str, Any]] = []
 
-    # === WATER KPIs ===
-    water_flag_kpi = detect_water_mention(text)
-    if water_flag_kpi:
-        kpis.append(water_flag_kpi)
+    # WATER
+    kpis.extend(_as_list(detect_water_mention(text)))
+    kpis.extend(_as_list(detect_water_withdrawal_total_m3(text)))
+    kpis.extend(_as_list(detect_water_consumption_total_m3(text)))
+    kpis.extend(_as_list(detect_water_recycled_total_m3(text)))
+    kpis.extend(_as_list(detect_water_discharge_total_m3(text)))
+    kpis.extend(_as_list(detect_water_pollutants_concentration_mg_l(text)))
+    kpis.extend(_as_list(detect_water_pollutants_total_kg(text)))
+    kpis.extend(_as_list(detect_water_stress_flag(text)))
+    kpis.extend(_as_list(detect_water_management_measures_flag(text)))
 
-    withdrawal_kpi = detect_water_withdrawal_total_m3(text)
-    if withdrawal_kpi:
-        kpis.append(withdrawal_kpi)
+    # CLIMATE
+    kpis.extend(_as_list(detect_ghg_avoided_total_t_co2e(text)))
+    kpis.extend(_as_list(detect_carbon_sequestered_total_t_co2e(text)))
 
-    consumption_kpi = detect_water_consumption_total_m3(text)
-    if consumption_kpi:
-        kpis.append(consumption_kpi)
+    # COASTAL
+    kpis.extend(_as_list(detect_coastline_restored_total_km(text)))
+    kpis.extend(_as_list(detect_habitat_restored_total_ha(text)))
 
-    recycled_kpi = detect_water_recycled_total_m3(text)
-    if recycled_kpi:
-        kpis.append(recycled_kpi)
+    # JOBS & SOCIAL
+    kpis.extend(_as_list(detect_jobs_created_total(text)))
+    kpis.extend(_as_list(detect_jobs_supported_total(text)))
+    kpis.extend(_as_list(detect_women_share_percent(text)))
+    kpis.extend(_as_list(detect_local_jobs_share_percent(text)))
 
-    discharge_kpi = detect_water_discharge_total_m3(text)
-    if discharge_kpi:
-        kpis.append(discharge_kpi)
+    # Defaults + annotate relevance (optional)
+    out: List[Dict[str, Any]] = []
+    for k in kpis:
+        if not isinstance(k, dict):
+            continue
+        k = _set_defaults(k, url=url)
 
-    poll_conc_kpi = detect_water_pollutants_concentration_mg_l(text)
-    if poll_conc_kpi:
-        kpis.append(poll_conc_kpi)
+        # Optional annotation useful for evaluation / debugging
+        if "relevance_score" not in k:
+            # keep existing behavior compatible with your DB insert defaults
+            k["relevance_score"] = 1.0 if relevant else 0.2
 
-    poll_total_kpi = detect_water_pollutants_total_kg(text)
-    if poll_total_kpi:
-        kpis.append(poll_total_kpi)
+        out.append(k)
 
-    water_stress_kpi = detect_water_stress_flag(text)
-    if water_stress_kpi:
-        kpis.append(water_stress_kpi)
+    out = _dedupe_kpis(out)
 
-    water_management_kpi = detect_water_management_measures_flag(text)
-    if water_management_kpi:
-        kpis.append(water_management_kpi)
+    if debug_kpi and not out:
+        print("[kpi_analyzer] No KPIs extracted.")
+        print(f"  url={url}")
+        print(f"  raw_len={len(raw)} text_len={len(text)}")
+        print(f"  relevant={relevant} (skip={skip_filter_a}, soft={soft_filter_a})")
+        # Show a tiny snippet to confirm content
+        snippet = text[:400].replace("\n", " ")
+        print(f"  text_head={snippet}")
 
-
-    # === CLIMATE KPIs ===
-    ghg_avoided_kpi = detect_ghg_avoided_total_t_co2e(text)
-    if ghg_avoided_kpi:
-        kpis.append(ghg_avoided_kpi)
-
-    carbon_seq_kpi = detect_carbon_sequestered_total_t_co2e(text)
-    if carbon_seq_kpi:
-        kpis.append(carbon_seq_kpi)
-
-    # === COASTAL KPIs ===
-    coastline_kpi = detect_coastline_restored_total_km(text)
-    if coastline_kpi:
-        kpis.append(coastline_kpi)
-
-    habitat_kpi = detect_habitat_restored_total_ha(text)
-    if habitat_kpi:
-        kpis.append(habitat_kpi)
-
-    # === JOBS & SOCIAL ===
-    jobs_created_kpi = detect_jobs_created_total(text)
-    if jobs_created_kpi:
-        kpis.append(jobs_created_kpi)
-
-    jobs_supported_kpi = detect_jobs_supported_total(text)
-    if jobs_supported_kpi:
-        kpis.append(jobs_supported_kpi)
-
-    women_share_kpi = detect_women_share_percent(text)
-    if women_share_kpi:
-        kpis.append(women_share_kpi)
-
-    local_jobs_share_kpi = detect_local_jobs_share_percent(text)
-    if local_jobs_share_kpi:
-        kpis.append(local_jobs_share_kpi)
-
-    return kpis
+    return out
