@@ -317,3 +317,22 @@ def detect_water_management_measures_flag(text: str) -> Optional[Dict]:
             "ctx": "water management measures",
         }
     return None
+# =============================================================================
+# Legacy compatibility helper (REQUIRED by coastal / jobs detectors)
+# DO NOT REMOVE
+# =============================================================================
+
+def _parse_quantity_with_multiplier(raw_number: str, raw_multiplier: Optional[str]):
+    """
+    Legacy helper used by coastal / jobs detectors.
+    Kept for backward compatibility.
+    """
+    try:
+        value = _normalize_number(raw_number)
+    except Exception:
+        return None
+
+    if not raw_multiplier:
+        return value
+
+    return value * MULTIPLIER_WORDS.get(raw_multiplier.lower().strip(), 1)
