@@ -59,7 +59,7 @@ def analyze_docs(
             extracted_from_url
         FROM oin.oin_master
         WHERE record_type = 'doc'
-          AND status = 'new'
+          AND status IN ('new','rejected_filterA')
         ORDER BY created_at ASC
         LIMIT %s;
         """,
