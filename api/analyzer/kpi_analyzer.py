@@ -129,6 +129,15 @@ def analyze_document_row(doc_row: Dict[str, Any]) -> List[Dict[str, Any]]:
     if poll_total_kpi:
         kpis.append(poll_total_kpi)
 
+    water_stress_kpi = detect_water_stress_flag(text)
+    if water_stress_kpi:
+        kpis.append(water_stress_kpi)
+
+    water_management_kpi = detect_water_management_measures_flag(text)
+    if water_management_kpi:
+        kpis.append(water_management_kpi)
+
+
     # === CLIMATE KPIs ===
     ghg_avoided_kpi = detect_ghg_avoided_total_t_co2e(text)
     if ghg_avoided_kpi:
