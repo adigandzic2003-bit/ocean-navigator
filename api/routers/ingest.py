@@ -1,19 +1,62 @@
-# api/routers/ingest.py
-
 from fastapi import APIRouter
-
-# Dieser Router ist für zukünftige Ingest-Endpunkte gedacht (z.B. Crawler → API → DB).
-# Aktuell definieren wir hier bewusst KEINE /analyze-Route mehr,
-# damit die Analyse ausschließlich über api/routers/analyze.py läuft.
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import psycopg2
+import os
+import json
 
 router = APIRouter(
     prefix="/ingest",
     tags=["ingest"],
 )
 
-# Beispiel-Platzhalter (für spätere Ingest-Endpoints):
-#
-# @router.post("/doc")
-# def ingest_doc(payload: Dict[str, Any], db=Depends(get_db)):
-#     ...
-#     return {"status": "ok"}
+class IngestPayload(BaseModel):
+    source: str
+    url: str
+    text: str
+    raw_html: Optional[str] = None
+    status: str = "new"
+    metadata: Dict[str, Any] = {}
+
+@router.post("")
+def ingest(payload: IngestPayload):
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO oin.oin_master (
+            record_type,
+            source_type,
+            source_id,
+            crawler_name,
+            status,
+            raw_text,
+            extracted_from_url,
+            meta
+        )
+        VALUES (
+            'doc',
+            'file',
+            %s,
+            'scrapy',
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        """,
+        (
+            payload.url,
+            payload.status,
+            payload.text,
+            payload.url,
+            json.dumps(payload.metadata),
+        )
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"status": "ok"}
