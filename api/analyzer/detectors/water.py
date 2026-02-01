@@ -242,3 +242,16 @@ def detect_water_recycled_total_m3(text: str):
 def detect_water_discharge_total_m3(text: str):
     return detect_water_table_volumes(text)
 
+# =============================================================================
+# Backwards-compatible wrappers for legacy analyzer imports
+# =============================================================================
+
+def detect_water_pollutants_concentration_mg_l(text: str):
+    """
+    Legacy wrapper.
+    Konzentrationswerte werden aktuell nicht tabellenbasiert extrahiert,
+    daher bewusst None (keine KPI).
+    """
+    return None
+
+
