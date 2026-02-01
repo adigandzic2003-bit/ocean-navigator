@@ -81,7 +81,6 @@ def _apply_multiplier(value: float, multiplier: Optional[str]) -> float:
 YEAR_PATTERN = re.compile(r"\b(20\d{2})\b")
 NUMBER_PATTERN = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 
-# m³ units (ONLY valid trigger for quantitative KPIs)
 VOLUME_UNIT_PATTERN = re.compile(
     r"(?:(million|millions|mio\.?|mrd\.?|bn|billion|thousand|k)\s*)?"
     r"(m3|m³|cubic\s*meters?|cubic\s*metres?)\b",
@@ -98,8 +97,7 @@ INTENSITY_HINT = re.compile(
 )
 
 WATER_CONTEXT_PATTERN = re.compile(
-    r"\b(water|wastewater|effluent|discharge|abwasser|einleitung|"
-    r"freshwater|groundwater|sewage)\b",
+    r"\b(water|wastewater|effluent|discharge|abwasser|einleitung|freshwater|groundwater|sewage)\b",
     re.IGNORECASE,
 )
 
@@ -111,8 +109,7 @@ TARGET_LANGUAGE_HINT = re.compile(
 )
 
 NON_VOLUME_CONTEXT_HINTS = re.compile(
-    r"\b(people|persons?|students?|employees?|countries?|"
-    r"percent|%|ratio|index|score|scope)\b",
+    r"\b(people|persons?|students?|employees?|countries?|percent|%|ratio|index|score|scope)\b",
     re.IGNORECASE,
 )
 
@@ -219,7 +216,7 @@ def _extract_table_volumes(text: str, max_hits: int = 40) -> List[Dict]:
 
         um = VOLUME_UNIT_PATTERN.search(row_l) or UNIT_ONLY_HINT.search(row_l)
         if not um:
-            continue  # HARD RULE: no m³ unit → no quantitative KPI
+            continue
 
         unit_pos = um.start()
         best = None
@@ -255,7 +252,7 @@ def _extract_table_volumes(text: str, max_hits: int = 40) -> List[Dict]:
 
 
 # =============================================================================
-# INLINE / NARRATIVE MODE – STRICT
+# INLINE MODE – STRICT
 # =============================================================================
 
 def _infer_kpi_from_snippet(snippet_l: str) -> Optional[str]:
@@ -275,18 +272,16 @@ def _extract_inline_volumes(text: str, max_hits: int = 20) -> List[Dict]:
 
     for m in INLINE_VOLUME_EXPR.finditer(text):
         s, e = m.span()
-
         sent_s, sent_e = _get_sentence_bounds(text, s)
-        sent = text[sent_s:sent_e]
-        sent_l = sent.lower()
+        sent = text[sent_s:sent_e].lower()
 
-        if INTENSITY_HINT.search(sent_l):
+        if INTENSITY_HINT.search(sent):
             continue
-        if TARGET_LANGUAGE_HINT.search(sent_l):
+        if TARGET_LANGUAGE_HINT.search(sent):
             continue
 
-        kpi_bucket = _infer_kpi_from_snippet(sent_l)
-        if not kpi_bucket:
+        bucket = _infer_kpi_from_snippet(sent)
+        if not bucket:
             continue
 
         try:
@@ -297,7 +292,7 @@ def _extract_inline_volumes(text: str, max_hits: int = 20) -> List[Dict]:
         value = _apply_multiplier(value, m.group("mul"))
 
         hits.append({
-            "kpi_key": f"water_{kpi_bucket}_total_m3",
+            "kpi_key": f"water_{bucket}_total_m3",
             "value": value,
             "ctx": _build_context(text, s, e, window=120),
         })
@@ -325,17 +320,18 @@ def _dedupe_hits(hits: List[Dict]) -> List[Dict]:
 # =============================================================================
 
 def detect_water_mention(text: str) -> Optional[Dict]:
-    if "water" in text.lower() or "wasser" in text.lower():
-        return {
-            "record_type": "kpi",
-            "source_type": "kpi",
-            "company": None,
-            "kpi_key": "water_mention_flag",
-            "kpi_value": 1,
-            "kpi_unit": "flag",
-            "ctx": "water mentioned in text",
-        }
-    return None
+    m = re.search(r"\b(water|wasser)\b", text, re.IGNORECASE)
+    if not m:
+        return None
+    return {
+        "record_type": "kpi",
+        "source_type": "kpi",
+        "company": None,
+        "kpi_key": "water_mention_flag",
+        "kpi_value": 1,
+        "kpi_unit": "flag",
+        "ctx": _build_context(text, m.start(), m.end(), window=120),
+    }
 
 
 def detect_water_table_volumes(text: str) -> Optional[List[Dict]]:
@@ -357,7 +353,7 @@ def detect_water_table_volumes(text: str) -> Optional[List[Dict]]:
 
 
 def detect_water_pollutants_total_kg(text: str) -> Optional[Dict]:
-    return None  # unchanged
+    return None
 
 
 def detect_water_stress_flag(text: str) -> Optional[Dict]:
