@@ -1,4 +1,5 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+import hashlib
 
 from fastapi import APIRouter, Depends, Query
 from psycopg2.extras import RealDictCursor
@@ -9,6 +10,31 @@ from api.analyzer.kpi_analyzer import analyze_document_row
 router = APIRouter(prefix="/analyze", tags=["analyze"])
 
 
+def _normalize_ctx(ctx: str) -> str:
+    """
+    Leichte Normalisierung des Kontextes für Deduplizierung.
+    Kein NLP, nur deterministisch.
+    """
+    if not ctx:
+        return ""
+    return " ".join(ctx.lower().split())
+
+
+def _kpi_fingerprint(kpi: Dict[str, Any]) -> str:
+    """
+    Erzeugt einen stabilen Fingerprint für ein KPI innerhalb eines Dokuments.
+    """
+    raw = "|".join(
+        [
+            kpi.get("kpi_key", ""),
+            str(kpi.get("kpi_value", "")),
+            str(kpi.get("kpi_unit", "")),
+            _normalize_ctx(kpi.get("ctx", "")),
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 @router.post("/")
 def analyze_docs(
     limit: int = Query(20, ge=1, le=200),
@@ -17,17 +43,16 @@ def analyze_docs(
     """
     Holt bis zu limit DOC-Records aus oin.oin_master mit status='new',
     wendet den KPI-Analyzer an und speichert gefundene KPIs wieder in oin.oin_master.
+    Doppelte KPIs pro Dokument werden unterdrückt.
     """
 
     cur = db.cursor(cursor_factory=RealDictCursor)
 
-    # 1) DOCs holen, die noch nicht verarbeitet wurden
+    # 1) DOCs holen
     cur.execute(
         """
         SELECT
             id,
-            record_type,
-            source_type,
             source_id,
             company,
             raw_text,
@@ -43,45 +68,41 @@ def analyze_docs(
     docs: List[Dict[str, Any]] = cur.fetchall()
 
     if not docs:
-        return {
-            "status": "ok",
-            "docs_analyzed": 0,
-            "kpis_inserted": 0,
-        }
+        return {"status": "ok", "docs_analyzed": 0, "kpis_inserted": 0}
 
     analyzed_count = 0
     kpi_inserted = 0
 
-    # 2) Jeden DOC durch den Analyzer schicken
+    # 2) Analyse
     for doc in docs:
         doc_id = doc["id"]
         doc_source_id = doc.get("source_id") or doc.get("extracted_from_url")
         extracted_from_url = doc.get("extracted_from_url")
         company = doc.get("company")
 
-        # --- Analyzer aufrufen ---
         kpi_results = analyze_document_row(doc)
 
-        # --- NEU: KPI-Ergebnisse normalisieren (Dict ODER List[Dict]) ---
+        # --- Normalisieren (Dict | List[Dict]) ---
         normalized_kpis: List[Dict[str, Any]] = []
-
         for item in kpi_results:
             if isinstance(item, list):
                 normalized_kpis.extend(item)
             elif isinstance(item, dict):
                 normalized_kpis.append(item)
-            # alles andere wird bewusst ignoriert
 
-        # --- KPIs persistieren ---
+        # --- NEU: Deduplizierung pro Dokument ---
+        seen_fingerprints: set[str] = set()
+        unique_kpis: List[Dict[str, Any]] = []
+
         for kpi in normalized_kpis:
-            kpi_key = kpi["kpi_key"]
-            kpi_value = kpi["kpi_value"]
-            kpi_unit = kpi.get("kpi_unit")
-            kpi_context = kpi.get("ctx")
+            fp = _kpi_fingerprint(kpi)
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+            unique_kpis.append(kpi)
 
-            # Aktuell fixer Default-Score (DSR-tauglich, deterministisch)
-            relevance_score = 1.0
-
+        # --- Persistenz ---
+        for kpi in unique_kpis:
             cur.execute(
                 """
                 INSERT INTO oin.oin_master (
@@ -112,20 +133,20 @@ def analyze_docs(
                 );
                 """,
                 (
-                    doc_source_id,       # source_id (vom DOC, NICHT NULL)
+                    doc_source_id,
                     company,
-                    kpi_key,
-                    kpi_value,
-                    kpi_unit,
-                    kpi_context,
+                    kpi["kpi_key"],
+                    kpi["kpi_value"],
+                    kpi.get("kpi_unit"),
+                    kpi.get("ctx"),
                     extracted_from_url,
                     doc_id,
-                    relevance_score,
+                    1.0,
                 ),
             )
             kpi_inserted += 1
 
-        # 3) Dokument-Status auf 'processed' setzen
+        # 3) DOC auf processed setzen
         cur.execute(
             """
             UPDATE oin.oin_master
