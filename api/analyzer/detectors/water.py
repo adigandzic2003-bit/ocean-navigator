@@ -89,7 +89,7 @@ def _apply_multiplier(value: float, multiplier: Optional[str]) -> float:
 YEAR_PATTERN = re.compile(r"\b(20\d{2})\b")
 NUMBER_PATTERN = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 
-# Accept "m3", "m³", optional "cubic meters", and optional multiplier words.
+# Accept "m3", "m³", optional "cubic meters/metres", and optional multiplier words.
 VOLUME_UNIT_PATTERN = re.compile(
     r"(?:(million|millions|mio\.?|mrd\.?|bn|billion|thousand|k)\s*)?"
     r"(m3|m³|cubic\s*meters?|cubic\s*metres?)\b",
@@ -113,6 +113,15 @@ WATER_CONTEXT_PATTERN = re.compile(
 TARGET_LANGUAGE_HINT = re.compile(
     r"\b(target|aim|goal|will|shall|plan|intend|by\s+20\d{2}|until\s+20\d{2}|"
     r"bis\s+20\d{2}|ziel|anstreben|soll|werden)\b",
+    re.IGNORECASE,
+)
+
+# Pragmatic anti-noise: contexts that often contain numbers but are not volume KPIs
+NON_VOLUME_CONTEXT_HINTS = re.compile(
+    r"\b(people|persons?|students?|minutes?|mins?|hours?|days?|"
+    r"countries?|sales|revenue|employees?|stations?|farmers?|"
+    r"percent|%|share|ratio|index|score|"
+    r"kg/m³|kg/m3|t/m³|mg/l|mg\/l)\b",
     re.IGNORECASE,
 )
 
@@ -147,15 +156,6 @@ ROW_KPI_HINTS = {
     "recycled": ["reuse", "reus", "recycle", "reclaimed", "reclaim", "wiederverwend", "rückgewinn", "recycl"],
 }
 
-# If a row contains these tokens, it is probably NOT a water volume KPI even if "water" appears.
-# This is a pragmatic anti-noise list based on the false positives you observed.
-NON_VOLUME_CONTEXT_HINTS = re.compile(
-    r"\b(people|persons?|students?|minutes?|mins?|hours?|days?|borewells?|stations?|"
-    r"farmers?|hectares?|ha\b|km\b|percent|%|share|ratio|index|score|"
-    r"kg/m³|kg/m3|t/m³|mg/l|mg\/l)\b",
-    re.IGNORECASE,
-)
-
 
 # =============================================================================
 # Lightweight fuzzy matching (no external deps)
@@ -166,6 +166,7 @@ def _similar(a: str, b: str) -> float:
 
 
 def _row_matches_any_trigger(row_l: str, triggers: List[str], fuzzy: bool = True) -> bool:
+    # Exact substring fast-path
     for t in triggers:
         if t in row_l:
             return True
@@ -182,6 +183,7 @@ def _row_matches_any_trigger(row_l: str, triggers: List[str], fuzzy: bool = True
             continue
         if _similar(row_l, t) >= 0.84:
             return True
+
     return False
 
 
@@ -197,6 +199,7 @@ def _infer_kpi_from_row(row_l: str) -> Optional[str]:
 # =============================================================================
 
 def _iter_table_rows(text: str) -> List[str]:
+    # Keep order; strip empties
     return [l.strip() for l in text.splitlines() if l.strip()]
 
 
@@ -208,19 +211,22 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
     """
     Extract water-related volume KPIs from table-ish text.
 
-    Precision upgrades (addresses your false positives):
+    Precision upgrades:
     - Require explicit volume unit (m3/m³/...) either on the same row OR in unit header context.
     - Reject intensity rows (kg/m³, per m³, m³/ha, etc.).
     - Reject forward-looking/target language for "total" KPIs (aim/target/by 2030...).
     - Reject common non-volume contexts (people, minutes, % ...).
-    - Avoid treating plain years (2024/2030) as volumes by itself.
+    - Prevent 'sticky unit' over the whole document via TTL.
+    - Do NOT extract multiple unrelated numbers per row; pick the number closest to a unit.
+    - Skip numeric-only rows ("2", "17", ...).
     """
     rows = _iter_table_rows(text)
 
     current_kpi: Optional[str] = None
     current_multiplier: Optional[str] = None
+
     have_unit_context: bool = False
-    unit_context_ttl: int = 0  # keeps unit context for N rows after seeing unit header
+    unit_context_ttl: int = 0  # keep unit context for N rows after seeing a unit header
 
     hits: List[Dict] = []
 
@@ -233,7 +239,7 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
                 current_kpi = kpi_key
                 break
 
-        # --- Unit detection ---
+        # --- Unit detection (header lines like "million m3" or just "m3") ---
         unit_match = VOLUME_UNIT_PATTERN.search(row_l)
         if unit_match:
             current_multiplier = unit_match.group(1)  # may be None
@@ -244,7 +250,7 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
             have_unit_context = True
             unit_context_ttl = 8
         else:
-            # decay unit context after some rows to prevent "sticky unit" over the whole document
+            # decay unit context to avoid becoming sticky across the whole document
             if unit_context_ttl > 0:
                 unit_context_ttl -= 1
             else:
@@ -255,28 +261,26 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         if not NUMBER_PATTERN.search(row):
             continue
 
-        # --- Guard: ignore trivial numeric-only rows like "2" / "17" / "4" ---
+        # --- Guard: ignore trivial numeric-only rows like "2" / "17" ---
         if re.fullmatch(r"\d+(?:[.,]\d+)?", row.strip()):
             continue
 
-
         # --- Precision guards: reject obviously wrong contexts ---
-        # 1) intensity
+        # 1) intensity / ratios
         if INTENSITY_HINT.search(row_l) or "kg/m" in row_l or "mg/l" in row_l:
             continue
 
-        # 2) non-volume contexts (people/minutes/%/etc.)
+        # 2) common non-volume contexts
         if NON_VOLUME_CONTEXT_HINTS.search(row_l):
             continue
 
-        # 3) forward-looking/targets: skip to avoid turning goals into "total" KPIs
+        # 3) forward-looking targets (avoid turning goals into totals)
         if TARGET_LANGUAGE_HINT.search(row_l):
             continue
 
         # --- Unit requirement ---
         row_has_unit = bool(UNIT_ONLY_HINT.search(row_l) or VOLUME_UNIT_PATTERN.search(row_l))
         if not (row_has_unit or have_unit_context):
-            # no unit on the row and no recent unit header context
             continue
 
         # --- Determine KPI bucket ---
@@ -284,28 +288,23 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         if not row_kpi:
             continue
 
-        # --- Guard: ignore trivial numeric-only rows like "2" / "17" / "4" ---
-        if re.fullmatch(r"\d+(?:[.,]\d+)?", row.strip()):
-            continue
-        
         # --- Extract candidate numbers (prefer numbers near unit tokens) ---
         nums = list(NUMBER_PATTERN.finditer(row))
         if not nums:
             continue
-        
+
         # Skip rows that contain only years (avoid year-as-volume)
         only_years = all(YEAR_PATTERN.fullmatch(m.group(0)) for m in nums)
         if only_years:
             continue
-        
-        # If the row itself contains a volume unit, pick the number closest to that unit.
-        # Otherwise, be conservative: require recent unit context and a short (table-like) row.
+
         um = VOLUME_UNIT_PATTERN.search(row_l) or UNIT_ONLY_HINT.search(row_l)
         unit_pos = um.start() if um else None
-        
+
         picked = None
-        
+
         if unit_pos is not None:
+            # choose number with minimal distance to unit position
             best = None
             best_dist = 10**9
             for m in nums:
@@ -317,6 +316,7 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
                     best = m
             picked = best
         else:
+            # no unit on row: be conservative
             if not have_unit_context:
                 continue
             # avoid narrative lines
@@ -328,21 +328,21 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
                     continue
                 picked = m
                 break
-        
+
         if not picked:
             continue
-        
-        # sanity: prevent "1) ..." enumerations from becoming volumes when unit isn't on the same row
+
+        # prevent list enumerations like "1) ..." when unit isn't on row
         if re.match(r"^\s*\d+\)\s*", row) and unit_pos is None:
             continue
-        
+
         try:
             value = _normalize_number(picked.group(0))
         except ValueError:
             continue
-        
+
         value = _apply_multiplier(value, current_multiplier)
-        
+
         hits.append(
             {
                 "kpi_key": f"water_{row_kpi}_total_m3",
@@ -350,9 +350,11 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
                 "ctx": row,
             }
         )
-        
+
         if len(hits) >= max_hits:
             return hits
+
+    return hits
 
 
 # =============================================================================
@@ -413,7 +415,7 @@ def detect_water_pollutants_total_kg(text: str) -> Optional[Dict]:
     """
     Precision hardened:
     - Requires water context near the match.
-    - Skips % / ratios / intensity contexts.
+    - Skips intensity/ratio contexts (kg/m³ etc.).
     """
     for m in POLLUTANT_TOTAL_PATTERN.finditer(text):
         if not _has_water_context_near(text, *m.span(), window=160):
@@ -422,7 +424,6 @@ def detect_water_pollutants_total_kg(text: str) -> Optional[Dict]:
         ctx = _build_context(text, *m.span(), window=120)
         ctx_l = ctx.lower()
 
-        # skip intensity / ratios
         if "kg/m" in ctx_l or "per m" in ctx_l or "mg/l" in ctx_l:
             continue
 
