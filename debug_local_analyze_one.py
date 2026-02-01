@@ -1,4 +1,3 @@
-cat > debug_local_analyze_one.py <<'PY'
 import os
 import psycopg2
 
