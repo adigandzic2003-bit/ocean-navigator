@@ -2,6 +2,7 @@ import re
 from difflib import SequenceMatcher
 from typing import Optional, Dict, List, Tuple
 
+
 # =============================================================================
 # Shared helpers (stable API)
 # =============================================================================
@@ -89,20 +90,29 @@ YEAR_PATTERN = re.compile(r"\b(20\d{2})\b")
 NUMBER_PATTERN = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 
 # Accept "m3", "m³", optional "cubic meters", and optional multiplier words.
-# - multiplier group is optional: we'll still extract m3 values without it.
 VOLUME_UNIT_PATTERN = re.compile(
     r"(?:(million|millions|mio\.?|mrd\.?|bn|billion|thousand|k)\s*)?"
     r"(m3|m³|cubic\s*meters?|cubic\s*metres?)\b",
     re.IGNORECASE,
 )
 
-# For table-style headers, also accept unit-only lines ("m3") without "million".
+# Unit-only hint (m3) without multiplier
 UNIT_ONLY_HINT = re.compile(r"\b(m3|m³|cubic\s*meters?|cubic\s*metres?)\b", re.IGNORECASE)
+
+# Intensity patterns to EXCLUDE (kg/m³, m³/ha, per m³, etc.)
+INTENSITY_HINT = re.compile(r"(/|per\s+)(m3|m³|cubic\s*meters?|cubic\s*metres?)\b", re.IGNORECASE)
 
 # Water context guard for ambiguous units like "kg" in long ESG docs
 WATER_CONTEXT_PATTERN = re.compile(
     r"\b(water|wastewater|effluent|discharge|abwasser|einleitung|gew[äa]sser|surface\s*water|"
     r"freshwater|groundwater|sewage|waste\s*water)\b",
+    re.IGNORECASE,
+)
+
+# Exclude target/forward-looking statements for "total" KPIs
+TARGET_LANGUAGE_HINT = re.compile(
+    r"\b(target|aim|goal|will|shall|plan|intend|by\s+20\d{2}|until\s+20\d{2}|"
+    r"bis\s+20\d{2}|ziel|anstreben|soll|werden)\b",
     re.IGNORECASE,
 )
 
@@ -131,11 +141,20 @@ WATER_HEADERS = {
 
 # Optional synonyms to decide a KPI from a row even if header wasn't captured.
 ROW_KPI_HINTS = {
-    "withdrawal": ["withdraw", "intake", "abstraction", "entnahme"],
+    "withdrawal": ["withdraw", "withdrawal", "intake", "abstraction", "entnahme"],
     "consumption": ["consume", "consumption", "use", "verbrauch", "nutzung"],
     "discharge": ["discharge", "effluent", "wastewater", "abwass", "einleitung"],
-    "recycled": ["reuse", "reus", "recycle", "reclaim", "wiederverwend", "rückgewinn", "recycl"],
+    "recycled": ["reuse", "reus", "recycle", "reclaimed", "reclaim", "wiederverwend", "rückgewinn", "recycl"],
 }
+
+# If a row contains these tokens, it is probably NOT a water volume KPI even if "water" appears.
+# This is a pragmatic anti-noise list based on the false positives you observed.
+NON_VOLUME_CONTEXT_HINTS = re.compile(
+    r"\b(people|persons?|students?|minutes?|mins?|hours?|days?|borewells?|stations?|"
+    r"farmers?|hectares?|ha\b|km\b|percent|%|share|ratio|index|score|"
+    r"kg/m³|kg/m3|t/m³|mg/l|mg\/l)\b",
+    re.IGNORECASE,
+)
 
 
 # =============================================================================
@@ -143,12 +162,10 @@ ROW_KPI_HINTS = {
 # =============================================================================
 
 def _similar(a: str, b: str) -> float:
-    # Cheap fuzzy ratio for header-like lines
     return SequenceMatcher(None, a, b).ratio()
 
 
 def _row_matches_any_trigger(row_l: str, triggers: List[str], fuzzy: bool = True) -> bool:
-    # Exact substring fast-path
     for t in triggers:
         if t in row_l:
             return True
@@ -160,7 +177,6 @@ def _row_matches_any_trigger(row_l: str, triggers: List[str], fuzzy: bool = True
     if len(row_l) > 180:
         return False
 
-    # Compare against triggers with moderate threshold
     for t in triggers:
         if len(t) < 6:
             continue
@@ -181,31 +197,30 @@ def _infer_kpi_from_row(row_l: str) -> Optional[str]:
 # =============================================================================
 
 def _iter_table_rows(text: str) -> List[str]:
-    # Keep order; strip empties
     return [l.strip() for l in text.splitlines() if l.strip()]
 
 
 # =============================================================================
-# Core table-driven volume extraction (improved)
+# Core table-driven volume extraction (precision-hardened)
 # =============================================================================
 
 def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
     """
     Extract water-related volume KPIs from table-ish text.
 
-    Improvements vs. old version:
-    - Accept m3/m³ even without "million" multipliers.
-    - Keep 'current_multiplier' optional; defaults to 1.
-    - Fuzzy header detection for minor variations/typos.
-    - Row-level KPI inference if header not set.
-    - Avoid exploding on random numeric lines by requiring a unit hint
-      either in current header context or in the same row.
+    Precision upgrades (addresses your false positives):
+    - Require explicit volume unit (m3/m³/...) either on the same row OR in unit header context.
+    - Reject intensity rows (kg/m³, per m³, m³/ha, etc.).
+    - Reject forward-looking/target language for "total" KPIs (aim/target/by 2030...).
+    - Reject common non-volume contexts (people, minutes, % ...).
+    - Avoid treating plain years (2024/2030) as volumes by itself.
     """
     rows = _iter_table_rows(text)
 
     current_kpi: Optional[str] = None
     current_multiplier: Optional[str] = None
-    have_unit_context: bool = False  # tracks if we saw any m3 unit near header recently
+    have_unit_context: bool = False
+    unit_context_ttl: int = 0  # keeps unit context for N rows after seeing unit header
 
     hits: List[Dict] = []
 
@@ -216,50 +231,83 @@ def _extract_table_volumes(text: str, max_hits: int = 50) -> List[Dict]:
         for kpi_key, triggers in WATER_HEADERS.items():
             if _row_matches_any_trigger(row_l, triggers, fuzzy=True):
                 current_kpi = kpi_key
-                # When KPI header changes, we keep unit context but don't force it
-                # (unit may be in next line)
                 break
 
-        # --- Unit detection (header lines like "million m3" or just "m3") ---
+        # --- Unit detection ---
         unit_match = VOLUME_UNIT_PATTERN.search(row_l)
         if unit_match:
             current_multiplier = unit_match.group(1)  # may be None
             have_unit_context = True
+            unit_context_ttl = 8
         elif UNIT_ONLY_HINT.search(row_l):
-            # Unit without multiplier
             current_multiplier = None
             have_unit_context = True
+            unit_context_ttl = 8
+        else:
+            # decay unit context after some rows to prevent "sticky unit" over the whole document
+            if unit_context_ttl > 0:
+                unit_context_ttl -= 1
+            else:
+                have_unit_context = False
+                current_multiplier = None
 
-        # --- Determine if this row is a numeric data row ---
+        # --- Numeric row check ---
         if not NUMBER_PATTERN.search(row):
             continue
 
-        # For extraction, we require a unit hint either:
-        # - in this same row, or
-        # - previously in header context (have_unit_context)
-        row_has_unit = bool(UNIT_ONLY_HINT.search(row_l) or VOLUME_UNIT_PATTERN.search(row_l))
-        if not (row_has_unit or have_unit_context):
+        # --- Precision guards: reject obviously wrong contexts ---
+        # 1) intensity
+        if INTENSITY_HINT.search(row_l) or "kg/m" in row_l or "mg/l" in row_l:
             continue
 
-        # KPI decision:
-        # - prefer current_kpi from header
-        # - otherwise infer from the row text itself
+        # 2) non-volume contexts (people/minutes/%/etc.)
+        if NON_VOLUME_CONTEXT_HINTS.search(row_l):
+            continue
+
+        # 3) forward-looking/targets: skip to avoid turning goals into "total" KPIs
+        if TARGET_LANGUAGE_HINT.search(row_l):
+            continue
+
+        # --- Unit requirement ---
+        row_has_unit = bool(UNIT_ONLY_HINT.search(row_l) or VOLUME_UNIT_PATTERN.search(row_l))
+        if not (row_has_unit or have_unit_context):
+            # no unit on the row and no recent unit header context
+            continue
+
+        # --- Determine KPI bucket ---
         row_kpi = current_kpi or _infer_kpi_from_row(row_l)
         if not row_kpi:
             continue
 
-        # Extract numbers
+        # --- Extract candidate numbers ---
         numbers = NUMBER_PATTERN.findall(row)
         if not numbers:
             continue
 
+        # If row contains only a year and no other numeric, skip (avoid year-as-volume)
+        # Example: "By 2030 ..." would be skipped already by TARGET_LANGUAGE_HINT,
+        # but this helps other cases.
+        only_years = all(YEAR_PATTERN.fullmatch(n) for n in numbers)
+        if only_years:
+            continue
+
+        # Heuristic: in real tables, the value is often the first non-year number
         for num in numbers:
+            # skip pure years
+            if YEAR_PATTERN.fullmatch(num):
+                continue
+
             try:
                 value = _normalize_number(num)
             except ValueError:
                 continue
 
             value = _apply_multiplier(value, current_multiplier)
+
+            # sanity: prevent absurd tiny "1,2,3" enumerations from becoming volumes
+            # if row starts with "1)" or "2)" and has no other strong evidence, skip
+            if re.match(r"^\s*\d+\)\s*", row) and not row_has_unit:
+                continue
 
             hits.append(
                 {
@@ -321,19 +369,29 @@ def detect_water_table_volumes(text: str) -> Optional[List[Dict]]:
 # A5–A6 – Pollutants
 # =============================================================================
 
-# Improve: prevent matching random "kg" unrelated to water by requiring water-context near match.
 POLLUTANT_TOTAL_PATTERN = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|t|tonnes?)\b", re.IGNORECASE)
 
 
-def _has_water_context_near(text: str, start: int, end: int, window: int = 120) -> bool:
+def _has_water_context_near(text: str, start: int, end: int, window: int = 140) -> bool:
     snippet = text[max(0, start - window): min(len(text), end + window)]
     return bool(WATER_CONTEXT_PATTERN.search(snippet))
 
 
 def detect_water_pollutants_total_kg(text: str) -> Optional[Dict]:
+    """
+    Precision hardened:
+    - Requires water context near the match.
+    - Skips % / ratios / intensity contexts.
+    """
     for m in POLLUTANT_TOTAL_PATTERN.finditer(text):
-        # Guard: water context nearby, otherwise skip
-        if not _has_water_context_near(text, *m.span(), window=140):
+        if not _has_water_context_near(text, *m.span(), window=160):
+            continue
+
+        ctx = _build_context(text, *m.span(), window=120)
+        ctx_l = ctx.lower()
+
+        # skip intensity / ratios
+        if "kg/m" in ctx_l or "per m" in ctx_l or "mg/l" in ctx_l:
             continue
 
         try:
@@ -352,7 +410,7 @@ def detect_water_pollutants_total_kg(text: str) -> Optional[Dict]:
             "kpi_key": "water_pollutants_total_kg",
             "kpi_value": value,
             "kpi_unit": "kg",
-            "ctx": _build_context(text, *m.span()),
+            "ctx": ctx,
         }
     return None
 
@@ -378,22 +436,26 @@ def detect_water_stress_flag(text: str) -> Optional[Dict]:
 
 def detect_water_management_measures_flag(text: str) -> Optional[Dict]:
     """
-    Slightly hardened:
-    - Still simple and explainable
-    - Avoids triggering on generic 'reduce' without water context nearby
+    Explainable, windowed co-occurrence:
+    - Requires water term
+    - Requires a management verb within +/-120 chars
     """
     t = text.lower()
 
-    # Quick reject if no water-related term exists at all
     if not any(o in t for o in ["water", "wasser", "abwasser", "wastewater", "effluent"]):
         return None
 
-    # Look for management verbs near a water token
-    verbs = ["reduce", "reduced", "reducing", "monitor", "monitoring", "optimize", "optimize", "manage", "managed",
-             "reduzieren", "reduziert", "überwachen", "optimieren", "managen", "steuern"]
+    verbs = [
+        "reduce", "reduced", "reducing",
+        "monitor", "monitoring",
+        "optimize", "optimized", "optimizing",
+        "manage", "managed", "managing",
+        "reduzieren", "reduziert", "reduzierung",
+        "überwachen", "optimieren",
+        "managen", "steuern",
+    ]
     water_terms = ["water", "wasser", "abwasser", "wastewater", "effluent"]
 
-    # Simple windowed co-occurrence: for each verb match, require water within +/-120 chars
     for v in verbs:
         for m in re.finditer(r"\b" + re.escape(v) + r"\b", t):
             s, e = m.span()
