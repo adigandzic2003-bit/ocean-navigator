@@ -17,7 +17,10 @@ from .detectors.water import (
     detect_water_discharge_total_m3,
     detect_water_pollutants_concentration_mg_l,
     detect_water_pollutants_total_kg,
+    detect_water_stress_flag,
+    detect_water_management_measures_flag,
 )
+
 
 # Climate Detectors (B1–B2)
 from .detectors.climate import (
